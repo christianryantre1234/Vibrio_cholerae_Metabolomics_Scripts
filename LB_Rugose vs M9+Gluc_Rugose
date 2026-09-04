@@ -1,0 +1,298 @@
+"""
+Pairwise Comparison: LB_Rugose vs M9+Glucose_Rugose
+=====================================================
+
+Compares an MZmine feature list across two conditions defined in a
+metadata CSV, applies data-quality filters using your blanks and QCs,
+and exports the top N most variable, statistically robust features
+between the two groups.
+
+WHAT THIS SCRIPT DOES
+----------------------
+1. Loads your MZmine feature list and metadata CSV.
+2. Identifies condition-A samples, condition-B samples, blank samples,
+   and QC samples from the metadata (blanks/QCs are auto-detected by
+   keyword, see BLANK_KEYWORDS / QC_KEYWORDS below).
+3. Fuzzy-matches metadata filenames to feature-table intensity columns
+   (MZmine appends suffixes like " Peak area" to filenames).
+4. Applies THREE quality filters, in order, before any statistics:
+     a. Blank filtering    -> drops features not clearly above blank background
+     b. QC RSD filtering   -> drops features that aren't reproducible in pooled QCs
+     c. Detection frequency -> drops features that are mostly "not detected"
+   Filtering on QC/blank data first (independent of the group comparison
+   itself) and THEN testing is the statistically correct order -- it
+   reduces the multiple-testing burden without biasing the result.
+5. On the surviving features: log2 transforms, computes group means,
+   log2 fold change, Welch's t-test p-value, and Benjamini-Hochberg
+   FDR-corrected q-value.
+6. Ranks by a combined "volcano-style" score (|log2FC| x -log10(p))
+   and exports the top N to a CSV, including all QC/blank/detection/
+   FDR metrics so you can see exactly why each feature made the cut.
+
+BEFORE YOU RUN IT
+------------------
+Edit the CONFIG block below -- especially:
+  - FEATURE_LIST_PATH / METADATA_PATH
+  - METADATA_FILENAME_COL / METADATA_CONDITION_COL
+  - CONDITION_A / CONDITION_B (must match your metadata values EXACTLY)
+  - BLANK_KEYWORDS / QC_KEYWORDS if your blank/QC labels don't contain
+    "blank" or "qc"/"pool"
+
+Requires: pandas, numpy, scipy
+    pip install pandas numpy scipy
+"""
+
+import re
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+# ============================================================
+# CONFIGURATION -- edit these to match your files
+# ============================================================
+
+FEATURE_LIST_PATH = "feature_list.csv"   # MZmine exported feature list (csv)
+METADATA_PATH = "metadata.csv"           # your metadata csv
+
+METADATA_FILENAME_COL = "filename"       # column in metadata.csv with sample/file names
+METADATA_CONDITION_COL = "condition"     # column in metadata.csv with condition labels
+
+CONDITION_A = "LB_Rugose"
+CONDITION_B = "M9+Glucose_Rugose"
+
+# Keywords (case-insensitive, matched against the condition column) used
+# to auto-detect blank and QC samples in your metadata
+BLANK_KEYWORDS = ["blank"]
+QC_KEYWORDS = ["qc", "pool"]
+
+TOP_N = 50
+
+# How to rank "most variable between the two conditions":
+#   "combined"    -> |log2 fold change| x -log10(p-value)  [default, recommended]
+#   "fold_change" -> rank purely by |log2 fold change|
+#   "ttest"       -> rank purely by p-value (most significant first)
+RANKING_METHOD = "combined"
+
+OUTPUT_PATH = f"top_{TOP_N}_variable_features_{CONDITION_A}_vs_{CONDITION_B}.csv"
+
+# --- Quality filter thresholds ---
+BLANK_FOLD_THRESHOLD = 5      # sample signal must be >= 5x mean blank signal
+QC_RSD_THRESHOLD = 30         # max allowed %RSD across pooled QC injections
+MIN_DETECTION_FRACTION = 0.75 # feature must be detected (>0) in >= 75% of
+                               # replicates in AT LEAST ONE of condition A/B
+FDR_ALPHA = 0.05              # q-value cutoff reported/flagged (not a hard filter)
+
+LOG_TRANSFORM = True   # log2-transform peak areas before stats (standard practice)
+PSEUDOCOUNT = 1         # added before log transform to avoid log(0)
+
+# ============================================================
+
+
+def match_feature_columns(feature_df, sample_filenames):
+    """
+    MZmine feature tables typically append suffixes to the raw filename
+    (e.g. 'sample1.mzML Peak area'). This matches each metadata filename
+    to the best corresponding column in the feature list.
+    """
+    matched = {}
+    unmatched = []
+    feature_cols = feature_df.columns.tolist()
+
+    for fname in sample_filenames:
+        base = re.sub(r"\.(mzml|mzxml|raw|d)$", "", str(fname), flags=re.I).strip()
+        candidates = [c for c in feature_cols if base.lower() in c.lower()]
+        if candidates:
+            area_cols = [c for c in candidates if "area" in c.lower()]
+            matched[fname] = area_cols[0] if area_cols else candidates[0]
+        else:
+            unmatched.append(fname)
+
+    return matched, unmatched
+
+
+def get_group_columns(meta, matched, condition_col, label):
+    """Return the matched feature-table columns for rows where condition_col == label."""
+    filenames = meta.loc[meta[condition_col] == label, METADATA_FILENAME_COL]
+    return [matched[f] for f in filenames if f in matched]
+
+
+def fdr_bh(pvals):
+    """Benjamini-Hochberg FDR correction. Returns q-values, same order as input."""
+    pvals = np.asarray(pvals, dtype=float)
+    n = len(pvals)
+    order = np.argsort(pvals)
+    ranked = pvals[order]
+    q = ranked * n / np.arange(1, n + 1)
+    q = np.minimum.accumulate(q[::-1])[::-1]  # enforce monotonicity
+    q = np.clip(q, 0, 1)
+    qvals = np.empty(n)
+    qvals[order] = q
+    return qvals
+
+
+def main():
+    feat = pd.read_csv(FEATURE_LIST_PATH)
+    meta = pd.read_csv(METADATA_PATH)
+    meta.columns = [c.strip() for c in meta.columns]
+
+    for col in (METADATA_FILENAME_COL, METADATA_CONDITION_COL):
+        if col not in meta.columns:
+            raise ValueError(
+                f"Column '{col}' not found in metadata. "
+                f"Available columns: {list(meta.columns)}"
+            )
+
+    cond_lower = meta[METADATA_CONDITION_COL].astype(str).str.lower()
+    is_blank = cond_lower.apply(lambda x: any(k in x for k in BLANK_KEYWORDS))
+    is_qc = cond_lower.apply(lambda x: any(k in x for k in QC_KEYWORDS))
+
+    blank_filenames = meta.loc[is_blank, METADATA_FILENAME_COL].tolist()
+    qc_filenames = meta.loc[is_qc, METADATA_FILENAME_COL].tolist()
+    a_filenames = meta.loc[meta[METADATA_CONDITION_COL] == CONDITION_A, METADATA_FILENAME_COL].tolist()
+    b_filenames = meta.loc[meta[METADATA_CONDITION_COL] == CONDITION_B, METADATA_FILENAME_COL].tolist()
+
+    print(f"Detected: {len(a_filenames)} {CONDITION_A} samples, {len(b_filenames)} {CONDITION_B} samples, "
+          f"{len(blank_filenames)} blank(s), {len(qc_filenames)} QC(s)")
+
+    if len(a_filenames) < 2 or len(b_filenames) < 2:
+        raise ValueError(
+            f"Need at least 2 replicates per condition. Found {len(a_filenames)} for {CONDITION_A} "
+            f"and {len(b_filenames)} for {CONDITION_B}. Check that CONDITION_A/CONDITION_B exactly "
+            f"match the values in your '{METADATA_CONDITION_COL}' column."
+        )
+
+    # --- Match ALL relevant filenames (A, B, blanks, QCs) to feature-table columns ---
+    all_filenames = a_filenames + b_filenames + blank_filenames + qc_filenames
+    matched, unmatched = match_feature_columns(feat, all_filenames)
+    if unmatched:
+        print(f"WARNING: {len(unmatched)} sample(s) had no matching column in the feature list:")
+        for u in unmatched:
+            print(f"   - {u}")
+
+    group_a_cols = [matched[f] for f in a_filenames if f in matched]
+    group_b_cols = [matched[f] for f in b_filenames if f in matched]
+    blank_cols = [matched[f] for f in blank_filenames if f in matched]
+    qc_cols = [matched[f] for f in qc_filenames if f in matched]
+
+    if len(group_a_cols) < 2 or len(group_b_cols) < 2:
+        raise ValueError("Fewer than 2 matched replicates per condition after column matching -- check your feature list column names.")
+
+    # --- Identify ID columns (row ID / m/z / RT) ---
+    intensity_cols = group_a_cols + group_b_cols + blank_cols + qc_cols
+    id_cols = [c for c in feat.columns if c not in intensity_cols]
+    keep_id_cols = [c for c in id_cols if re.search(r"row (id|m/z|retention time)", c, re.I)]
+    if not keep_id_cols:
+        keep_id_cols = id_cols[:3]  # fallback if MZmine naming differs
+
+    data = feat[keep_id_cols + group_a_cols + group_b_cols + blank_cols + qc_cols].copy()
+    data[group_a_cols + group_b_cols + blank_cols + qc_cols] = data[
+        group_a_cols + group_b_cols + blank_cols + qc_cols
+    ].fillna(0)
+
+    raw_a = data[group_a_cols].to_numpy(dtype=float)
+    raw_b = data[group_b_cols].to_numpy(dtype=float)
+
+    n_features_start = len(data)
+    keep_mask = np.ones(n_features_start, dtype=bool)
+
+    # ============================================================
+    # FILTER 1: Blank filtering
+    # ============================================================
+    if blank_cols:
+        raw_blank = data[blank_cols].to_numpy(dtype=float)
+        blank_mean = raw_blank.mean(axis=1)
+        group_max_mean = np.maximum(raw_a.mean(axis=1), raw_b.mean(axis=1))
+        blank_pass = group_max_mean >= BLANK_FOLD_THRESHOLD * (blank_mean + 1)
+        data["blank_mean"] = blank_mean
+        data["passes_blank_filter"] = blank_pass
+        keep_mask &= blank_pass
+        print(f"Blank filter: {blank_pass.sum()}/{n_features_start} features pass "
+              f"(>= {BLANK_FOLD_THRESHOLD}x mean blank signal)")
+    else:
+        print("No blank samples detected -- skipping blank filter. "
+              "(Check BLANK_KEYWORDS if you do have blanks in metadata.)")
+        data["passes_blank_filter"] = True
+
+    # ============================================================
+    # FILTER 2: QC RSD filtering (reproducibility)
+    # ============================================================
+    if len(qc_cols) >= 2:
+        raw_qc = data[qc_cols].to_numpy(dtype=float)
+        qc_mean = raw_qc.mean(axis=1)
+        qc_std = raw_qc.std(axis=1, ddof=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            qc_rsd = np.where(qc_mean > 0, (qc_std / qc_mean) * 100, np.inf)
+        rsd_pass = qc_rsd <= QC_RSD_THRESHOLD
+        data["QC_RSD_percent"] = qc_rsd
+        data["passes_QC_RSD_filter"] = rsd_pass
+        keep_mask &= rsd_pass
+        print(f"QC RSD filter: {rsd_pass.sum()}/{n_features_start} features pass (RSD <= {QC_RSD_THRESHOLD}%)")
+    else:
+        print("Fewer than 2 QC samples detected -- skipping QC RSD filter. "
+              "(Check QC_KEYWORDS if you do have QCs in metadata.)")
+        data["passes_QC_RSD_filter"] = True
+
+    # ============================================================
+    # FILTER 3: Detection frequency
+    # ============================================================
+    detect_frac_a = (raw_a > 0).mean(axis=1)
+    detect_frac_b = (raw_b > 0).mean(axis=1)
+    detect_pass = (detect_frac_a >= MIN_DETECTION_FRACTION) | (detect_frac_b >= MIN_DETECTION_FRACTION)
+    data["detection_fraction_A"] = detect_frac_a
+    data["detection_fraction_B"] = detect_frac_b
+    data["passes_detection_filter"] = detect_pass
+    keep_mask &= detect_pass
+    print(f"Detection filter: {detect_pass.sum()}/{n_features_start} features pass "
+          f"(detected in >= {int(MIN_DETECTION_FRACTION*100)}% of replicates in at least one group)")
+
+    print(f"\nFeatures passing ALL quality filters: {keep_mask.sum()}/{n_features_start}")
+
+    filtered = data[keep_mask].copy()
+    if len(filtered) == 0:
+        raise ValueError("No features survived quality filtering -- thresholds may be too strict for your data. "
+                          "Consider relaxing BLANK_FOLD_THRESHOLD, QC_RSD_THRESHOLD, or MIN_DETECTION_FRACTION.")
+
+    # ============================================================
+    # Statistics on filtered features only
+    # ============================================================
+    vals_a = filtered[group_a_cols].to_numpy(dtype=float)
+    vals_b = filtered[group_b_cols].to_numpy(dtype=float)
+
+    if LOG_TRANSFORM:
+        vals_a = np.log2(vals_a + PSEUDOCOUNT)
+        vals_b = np.log2(vals_b + PSEUDOCOUNT)
+
+    mean_a = vals_a.mean(axis=1)
+    mean_b = vals_b.mean(axis=1)
+    log2fc = mean_b - mean_a  # positive = higher in condition B
+
+    tstat, pval = stats.ttest_ind(vals_b, vals_a, axis=1, equal_var=False, nan_policy="omit")
+    qval = fdr_bh(pval)
+
+    filtered[f"mean_{CONDITION_A}"] = mean_a
+    filtered[f"mean_{CONDITION_B}"] = mean_b
+    filtered["log2FC_B_over_A"] = log2fc
+    filtered["t_statistic"] = tstat
+    filtered["p_value"] = pval
+    filtered["q_value_FDR"] = qval
+    filtered["significant_FDR_0.05"] = qval <= FDR_ALPHA
+
+    n_sig = (qval <= FDR_ALPHA).sum()
+    print(f"Of these, {n_sig}/{len(filtered)} are significant at FDR <= {FDR_ALPHA}")
+
+    p_safe = np.clip(pval, 1e-300, 1)
+    if RANKING_METHOD == "fold_change":
+        filtered["rank_score"] = filtered["log2FC_B_over_A"].abs()
+    elif RANKING_METHOD == "ttest":
+        filtered["rank_score"] = -np.log10(p_safe)
+    else:  # combined (default)
+        filtered["rank_score"] = filtered["log2FC_B_over_A"].abs() * -np.log10(p_safe)
+
+    top_features = filtered.sort_values("rank_score", ascending=False).head(TOP_N)
+    top_features.to_csv(OUTPUT_PATH, index=False)
+
+    print(f"\nSaved top {min(TOP_N, len(filtered))} features to: {OUTPUT_PATH}")
+
+
+if __name__ == "__main__":
+    main()
