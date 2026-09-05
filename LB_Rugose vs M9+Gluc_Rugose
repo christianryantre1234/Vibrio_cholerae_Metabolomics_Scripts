@@ -10,24 +10,33 @@ between the two groups.
 WHAT THIS SCRIPT DOES
 ----------------------
 1. Loads your MZmine feature list and metadata CSV.
-2. Identifies condition-A samples, condition-B samples, blank samples,
-   and QC samples from the metadata (blanks/QCs are auto-detected by
-   keyword, see BLANK_KEYWORDS / QC_KEYWORDS below).
+2. Identifies condition-A samples, condition-B samples, QC samples,
+   and TWO separate blank types: a solvent/MeOH blank (used for
+   background-contamination filtering) and an ISTD blank (used to
+   flag features that are likely your own spiked internal standards,
+   not biology). These are handled separately because they answer
+   different questions -- see the note above BLANK CONFIG below.
 3. Fuzzy-matches metadata filenames to feature-table intensity columns
    (MZmine appends suffixes like " Peak area" to filenames).
-4. Applies THREE quality filters, in order, before any statistics:
-     a. Blank filtering    -> drops features not clearly above blank background
-     b. QC RSD filtering   -> drops features that aren't reproducible in pooled QCs
-     c. Detection frequency -> drops features that are mostly "not detected"
-   Filtering on QC/blank data first (independent of the group comparison
-   itself) and THEN testing is the statistically correct order -- it
-   reduces the multiple-testing burden without biasing the result.
-5. On the surviving features: log2 transforms, computes group means,
+4. Applies quality filters, in order, before any statistics:
+     a. Solvent blank filtering -> drops features not clearly above
+        solvent/instrument background
+     b. QC RSD filtering         -> drops features not reproducible
+        in pooled QCs
+     c. Detection frequency      -> drops features mostly "not detected"
+   Filtering on QC/blank data first (independent of the group
+   comparison itself) and THEN testing is the statistically correct
+   order -- it reduces the multiple-testing burden without biasing
+   the result.
+5. Flags (does not auto-remove) features that look like they might be
+   internal-standard signal rather than biology, based on the ISTD
+   blank.
+6. On the surviving features: log2 transforms, computes group means,
    log2 fold change, Welch's t-test p-value, and Benjamini-Hochberg
    FDR-corrected q-value.
-6. Ranks by a combined "volcano-style" score (|log2FC| x -log10(p))
+7. Ranks by a combined "volcano-style" score (|log2FC| x -log10(p))
    and exports the top N to a CSV, including all QC/blank/detection/
-   FDR metrics so you can see exactly why each feature made the cut.
+   ISTD/FDR metrics so you can see exactly why each feature made the cut.
 
 BEFORE YOU RUN IT
 ------------------
@@ -35,8 +44,8 @@ Edit the CONFIG block below -- especially:
   - FEATURE_LIST_PATH / METADATA_PATH
   - METADATA_FILENAME_COL / METADATA_CONDITION_COL
   - CONDITION_A / CONDITION_B (must match your metadata values EXACTLY)
-  - BLANK_KEYWORDS / QC_KEYWORDS if your blank/QC labels don't contain
-    "blank" or "qc"/"pool"
+  - SOLVENT_BLANK_KEYWORDS / ISTD_BLANK_KEYWORDS / QC_KEYWORDS if your
+    labels don't contain "meoh"/"solvent", "istd", or "qc"/"pool"
 
 Requires: pandas, numpy, scipy
     pip install pandas numpy scipy
@@ -51,19 +60,26 @@ from scipy import stats
 # CONFIGURATION -- edit these to match your files
 # ============================================================
 
-FEATURE_LIST_PATH = "feature_list.csv"   # MZmine exported feature list (csv)
-METADATA_PATH = "metadata.csv"           # your metadata csv
+FEATURE_LIST_PATH = "Vc_comparative_metabolomics-1_neg_export_full_feature_table.csv"   # MZmine exported feature list (csv)
+METADATA_PATH = "metadata_pairwise_comparison_LB_vs_Gluc.csv"           # your metadata csv
 
 METADATA_FILENAME_COL = "filename"       # column in metadata.csv with sample/file names
 METADATA_CONDITION_COL = "condition"     # column in metadata.csv with condition labels
 
 CONDITION_A = "LB_Rugose"
-CONDITION_B = "M9+Glucose_Rugose"
+CONDITION_B = "M9+Gluc_Rugose"
 
-# Keywords (case-insensitive, matched against the condition column) used
-# to auto-detect blank and QC samples in your metadata
-BLANK_KEYWORDS = ["blank"]
+# --- Blank / QC auto-detection (case-insensitive substring match against
+#     your condition column). Adjust these if your labels differ. ---
+SOLVENT_BLANK_KEYWORDS = ["meoh", "solvent"]  # e.g. "MeOH_Blank" -> used for background filtering
+ISTD_BLANK_KEYWORDS = ["istd"]                # e.g. "ISTD_Blank" -> used only to flag likely ISTD peaks
 QC_KEYWORDS = ["qc", "pool"]
+
+# If a sample's condition contains "blank" but matches NEITHER list above
+# (e.g. you only have one generic "Blank" type), it's treated as a solvent
+# blank by default so the background filter still works.
+TREAT_UNLABELED_BLANK_AS_SOLVENT = True
+GENERIC_BLANK_KEYWORD = "blank"
 
 TOP_N = 50
 
@@ -76,11 +92,17 @@ RANKING_METHOD = "combined"
 OUTPUT_PATH = f"top_{TOP_N}_variable_features_{CONDITION_A}_vs_{CONDITION_B}.csv"
 
 # --- Quality filter thresholds ---
-BLANK_FOLD_THRESHOLD = 5      # sample signal must be >= 5x mean blank signal
+BLANK_FOLD_THRESHOLD = 5      # sample signal must be >= 5x mean solvent-blank signal
 QC_RSD_THRESHOLD = 30         # max allowed %RSD across pooled QC injections
 MIN_DETECTION_FRACTION = 0.75 # feature must be detected (>0) in >= 75% of
                                # replicates in AT LEAST ONE of condition A/B
 FDR_ALPHA = 0.05              # q-value cutoff reported/flagged (not a hard filter)
+
+# ISTD-blank flagging (informational -- does NOT drop features by default,
+# since falsely dropping real biology is riskier than leaving a flag column
+# for you to review/cross-check against your known ISTD list)
+ISTD_FLAG_RATIO = 3           # flag a feature if group signal < 3x its ISTD-blank signal
+EXCLUDE_ISTD_FLAGGED_FEATURES = False  # set True to hard-drop flagged features instead
 
 LOG_TRANSFORM = True   # log2-transform peak areas before stats (standard practice)
 PSEUDOCOUNT = 1         # added before log transform to avoid log(0)
@@ -110,12 +132,6 @@ def match_feature_columns(feature_df, sample_filenames):
     return matched, unmatched
 
 
-def get_group_columns(meta, matched, condition_col, label):
-    """Return the matched feature-table columns for rows where condition_col == label."""
-    filenames = meta.loc[meta[condition_col] == label, METADATA_FILENAME_COL]
-    return [matched[f] for f in filenames if f in matched]
-
-
 def fdr_bh(pvals):
     """Benjamini-Hochberg FDR correction. Returns q-values, same order as input."""
     pvals = np.asarray(pvals, dtype=float)
@@ -142,17 +158,53 @@ def main():
                 f"Available columns: {list(meta.columns)}"
             )
 
-    cond_lower = meta[METADATA_CONDITION_COL].astype(str).str.lower()
-    is_blank = cond_lower.apply(lambda x: any(k in x for k in BLANK_KEYWORDS))
-    is_qc = cond_lower.apply(lambda x: any(k in x for k in QC_KEYWORDS))
+    print(f"Unique values found in '{METADATA_CONDITION_COL}': {meta[METADATA_CONDITION_COL].unique().tolist()}")
 
-    blank_filenames = meta.loc[is_blank, METADATA_FILENAME_COL].tolist()
+    # --- Drop exact duplicate metadata rows (same filename + condition listed twice) ---
+    n_meta_before = len(meta)
+    meta = meta.drop_duplicates(subset=[METADATA_FILENAME_COL, METADATA_CONDITION_COL]).reset_index(drop=True)
+    if len(meta) < n_meta_before:
+        print(f"Dropped {n_meta_before - len(meta)} exact duplicate metadata row(s).")
+
+    # --- Warn (and resolve) if the SAME filename appears under different conditions ---
+    dup_filenames = meta[METADATA_FILENAME_COL][meta[METADATA_FILENAME_COL].duplicated()].unique().tolist()
+    if dup_filenames:
+        print(f"WARNING: {len(dup_filenames)} filename(s) appear under more than one condition in metadata "
+              f"-- keeping only the first occurrence of each: {dup_filenames}")
+        meta = meta.drop_duplicates(subset=[METADATA_FILENAME_COL], keep="first").reset_index(drop=True)
+
+    cond_lower = meta[METADATA_CONDITION_COL].astype(str).str.lower()
+
+    raw_istd = cond_lower.apply(lambda x: any(k in x for k in ISTD_BLANK_KEYWORDS))
+    raw_solvent = cond_lower.apply(lambda x: any(k in x for k in SOLVENT_BLANK_KEYWORDS))
+    raw_generic_blank = cond_lower.str.contains(GENERIC_BLANK_KEYWORD)
+    raw_qc = cond_lower.apply(lambda x: any(k in x for k in QC_KEYWORDS))
+
+    # --- Make categories mutually exclusive with a fixed priority, and warn on any overlap ---
+    # Priority: ISTD blank > solvent blank > QC > generic blank fallback
+    is_istd_blank = raw_istd
+    is_solvent_blank = raw_solvent & ~is_istd_blank
+    is_qc = raw_qc & ~is_istd_blank & ~is_solvent_blank
+    is_generic_blank = raw_generic_blank & ~is_istd_blank & ~is_solvent_blank & ~is_qc
+    if TREAT_UNLABELED_BLANK_AS_SOLVENT:
+        is_solvent_blank = is_solvent_blank | is_generic_blank
+
+    overlap_mask = (raw_istd.astype(int) + raw_solvent.astype(int) + raw_qc.astype(int)) > 1
+    if overlap_mask.any():
+        overlap_names = meta.loc[overlap_mask, METADATA_FILENAME_COL].tolist()
+        print(f"WARNING: {len(overlap_names)} sample(s) matched more than one keyword category "
+              f"(e.g. condition text contains both 'qc' and 'meoh') -- resolved using priority "
+              f"ISTD > solvent blank > QC: {overlap_names}")
+
+    solvent_blank_filenames = meta.loc[is_solvent_blank, METADATA_FILENAME_COL].tolist()
+    istd_blank_filenames = meta.loc[is_istd_blank, METADATA_FILENAME_COL].tolist()
     qc_filenames = meta.loc[is_qc, METADATA_FILENAME_COL].tolist()
     a_filenames = meta.loc[meta[METADATA_CONDITION_COL] == CONDITION_A, METADATA_FILENAME_COL].tolist()
     b_filenames = meta.loc[meta[METADATA_CONDITION_COL] == CONDITION_B, METADATA_FILENAME_COL].tolist()
 
     print(f"Detected: {len(a_filenames)} {CONDITION_A} samples, {len(b_filenames)} {CONDITION_B} samples, "
-          f"{len(blank_filenames)} blank(s), {len(qc_filenames)} QC(s)")
+          f"{len(solvent_blank_filenames)} solvent blank(s), {len(istd_blank_filenames)} ISTD blank(s), "
+          f"{len(qc_filenames)} QC(s)")
 
     if len(a_filenames) < 2 or len(b_filenames) < 2:
         raise ValueError(
@@ -161,8 +213,8 @@ def main():
             f"match the values in your '{METADATA_CONDITION_COL}' column."
         )
 
-    # --- Match ALL relevant filenames (A, B, blanks, QCs) to feature-table columns ---
-    all_filenames = a_filenames + b_filenames + blank_filenames + qc_filenames
+    # --- Match ALL relevant filenames to feature-table columns ---
+    all_filenames = a_filenames + b_filenames + solvent_blank_filenames + istd_blank_filenames + qc_filenames
     matched, unmatched = match_feature_columns(feat, all_filenames)
     if unmatched:
         print(f"WARNING: {len(unmatched)} sample(s) had no matching column in the feature list:")
@@ -171,47 +223,82 @@ def main():
 
     group_a_cols = [matched[f] for f in a_filenames if f in matched]
     group_b_cols = [matched[f] for f in b_filenames if f in matched]
-    blank_cols = [matched[f] for f in blank_filenames if f in matched]
+    solvent_blank_cols = [matched[f] for f in solvent_blank_filenames if f in matched]
+    istd_blank_cols = [matched[f] for f in istd_blank_filenames if f in matched]
     qc_cols = [matched[f] for f in qc_filenames if f in matched]
 
     if len(group_a_cols) < 2 or len(group_b_cols) < 2:
         raise ValueError("Fewer than 2 matched replicates per condition after column matching -- check your feature list column names.")
 
     # --- Identify ID columns (row ID / m/z / RT) ---
-    intensity_cols = group_a_cols + group_b_cols + blank_cols + qc_cols
+    intensity_cols = group_a_cols + group_b_cols + solvent_blank_cols + istd_blank_cols + qc_cols
+
+    # Safety net: if any feature-table column got pulled into more than one sample
+    # group (e.g. two metadata filenames both fuzzy-matched to the same column),
+    # fail here with a clear message instead of a cryptic pandas error later.
+    dup_cols = [c for c in set(intensity_cols) if intensity_cols.count(c) > 1]
+    if dup_cols:
+        raise ValueError(
+            "The same feature-table column got assigned to more than one sample group: "
+            f"{dup_cols}. This usually means two metadata filenames fuzzy-matched to the same "
+            "feature-list column, or one sample's condition label matched more than one keyword "
+            "category. Check your metadata for duplicate/ambiguous filenames or condition labels "
+            "containing overlapping keywords (e.g. both 'qc' and 'meoh')."
+        )
+
     id_cols = [c for c in feat.columns if c not in intensity_cols]
     keep_id_cols = [c for c in id_cols if re.search(r"row (id|m/z|retention time)", c, re.I)]
     if not keep_id_cols:
         keep_id_cols = id_cols[:3]  # fallback if MZmine naming differs
 
-    data = feat[keep_id_cols + group_a_cols + group_b_cols + blank_cols + qc_cols].copy()
-    data[group_a_cols + group_b_cols + blank_cols + qc_cols] = data[
-        group_a_cols + group_b_cols + blank_cols + qc_cols
-    ].fillna(0)
+    data = feat[keep_id_cols + intensity_cols].copy()
+    data[intensity_cols] = data[intensity_cols].fillna(0)
 
     raw_a = data[group_a_cols].to_numpy(dtype=float)
     raw_b = data[group_b_cols].to_numpy(dtype=float)
+    group_max_mean = np.maximum(raw_a.mean(axis=1), raw_b.mean(axis=1))
 
     n_features_start = len(data)
     keep_mask = np.ones(n_features_start, dtype=bool)
 
     # ============================================================
-    # FILTER 1: Blank filtering
+    # FILTER 1: Solvent blank filtering (background contamination)
     # ============================================================
-    if blank_cols:
-        raw_blank = data[blank_cols].to_numpy(dtype=float)
-        blank_mean = raw_blank.mean(axis=1)
-        group_max_mean = np.maximum(raw_a.mean(axis=1), raw_b.mean(axis=1))
-        blank_pass = group_max_mean >= BLANK_FOLD_THRESHOLD * (blank_mean + 1)
-        data["blank_mean"] = blank_mean
+    if solvent_blank_cols:
+        raw_solvent_blank = data[solvent_blank_cols].to_numpy(dtype=float)
+        solvent_blank_mean = raw_solvent_blank.mean(axis=1)
+        blank_pass = group_max_mean >= BLANK_FOLD_THRESHOLD * (solvent_blank_mean + 1)
+        data["solvent_blank_mean"] = solvent_blank_mean
         data["passes_blank_filter"] = blank_pass
         keep_mask &= blank_pass
-        print(f"Blank filter: {blank_pass.sum()}/{n_features_start} features pass "
-              f"(>= {BLANK_FOLD_THRESHOLD}x mean blank signal)")
+        print(f"Solvent blank filter: {blank_pass.sum()}/{n_features_start} features pass "
+              f"(>= {BLANK_FOLD_THRESHOLD}x mean solvent-blank signal)")
     else:
-        print("No blank samples detected -- skipping blank filter. "
-              "(Check BLANK_KEYWORDS if you do have blanks in metadata.)")
+        print("No solvent/MeOH blank detected -- skipping background filter. "
+              "(Check SOLVENT_BLANK_KEYWORDS.)")
         data["passes_blank_filter"] = True
+
+    # ============================================================
+    # ISTD blank flagging (informational, not a hard filter by default)
+    # ============================================================
+    if istd_blank_cols:
+        raw_istd_blank = data[istd_blank_cols].to_numpy(dtype=float)
+        istd_blank_mean = raw_istd_blank.mean(axis=1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio_to_istd = np.where(istd_blank_mean > 0, group_max_mean / istd_blank_mean, np.inf)
+        istd_flag = ratio_to_istd < ISTD_FLAG_RATIO
+        data["ISTD_blank_mean"] = istd_blank_mean
+        data["ratio_to_ISTD_blank"] = ratio_to_istd
+        data["possible_ISTD_signal"] = istd_flag
+        print(f"ISTD blank check: {istd_flag.sum()}/{n_features_start} feature(s) flagged as possibly "
+              f"reflecting internal-standard signal rather than biology (sample intensity < {ISTD_FLAG_RATIO}x "
+              f"its ISTD-blank intensity). Review these against your known ISTD list.")
+        if EXCLUDE_ISTD_FLAGGED_FEATURES:
+            keep_mask &= ~istd_flag
+            print("EXCLUDE_ISTD_FLAGGED_FEATURES=True -> these were removed from consideration.")
+    else:
+        print("No ISTD blank detected -- skipping ISTD flagging. (Check ISTD_BLANK_KEYWORDS.)")
+        data["possible_ISTD_signal"] = False
 
     # ============================================================
     # FILTER 2: QC RSD filtering (reproducibility)
@@ -228,8 +315,7 @@ def main():
         keep_mask &= rsd_pass
         print(f"QC RSD filter: {rsd_pass.sum()}/{n_features_start} features pass (RSD <= {QC_RSD_THRESHOLD}%)")
     else:
-        print("Fewer than 2 QC samples detected -- skipping QC RSD filter. "
-              "(Check QC_KEYWORDS if you do have QCs in metadata.)")
+        print("Fewer than 2 QC samples detected -- skipping QC RSD filter. (Check QC_KEYWORDS.)")
         data["passes_QC_RSD_filter"] = True
 
     # ============================================================
@@ -245,7 +331,7 @@ def main():
     print(f"Detection filter: {detect_pass.sum()}/{n_features_start} features pass "
           f"(detected in >= {int(MIN_DETECTION_FRACTION*100)}% of replicates in at least one group)")
 
-    print(f"\nFeatures passing ALL quality filters: {keep_mask.sum()}/{n_features_start}")
+    print(f"\nFeatures passing all active quality filters: {keep_mask.sum()}/{n_features_start}")
 
     filtered = data[keep_mask].copy()
     if len(filtered) == 0:
