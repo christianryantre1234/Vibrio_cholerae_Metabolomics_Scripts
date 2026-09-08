@@ -1,0 +1,232 @@
+## ------------------------------------------------------------------
+## Shiny app: interactive heatmap of the MZmine2 feature table,
+## filterable by media type using the run-2 metadata file
+## ------------------------------------------------------------------
+## Requires: run2_mzmine2_feature_table.xlsx and run-2_metadata.xlsx
+## to sit in the same folder as this app.R
+## ------------------------------------------------------------------
+
+library(shiny)
+library(readxl)
+library(pheatmap)
+
+## ---- Load & prep data once at app start --------------------------------
+
+feature_file  <- "run-2_mzmine2_feature_table.xlsx"
+metadata_file <- "run-2_metadata.xlsx"
+
+raw_features <- read_excel(feature_file)
+metadata     <- read_excel(metadata_file)
+
+# Keep only "Peak area" columns
+area_cols <- grep("Peak area$", colnames(raw_features), value = TRUE)
+feat_mat  <- as.data.frame(raw_features[, area_cols])
+rownames(feat_mat) <- raw_features$id
+
+# Map each "Peak area" column back to its .mzML filename so we can join
+# against the metadata table
+col_filename <- sub(" Peak area$", "", area_cols)
+
+# Human-readable column label, e.g. "D1_M9+Gly_Vc_Rug-1"
+clean_name <- function(x) {
+  x <- sub("^\\d+_\\d+_", "", x)
+  x <- sub("\\.mzML$", "", x)
+  x <- sub("_R\\d+_.*$", "", x)
+  x
+}
+col_label <- clean_name(col_filename)
+
+# Attach metadata (media, day, strain, sample type) to each column
+meta_match <- metadata[match(col_filename, metadata$filename), ]
+
+sample_info <- data.frame(
+  col_index = seq_along(area_cols),
+  filename  = col_filename,
+  label     = col_label,
+  media     = meta_match$media,
+  day       = meta_match$day,
+  strain    = meta_match$strain,
+  type      = meta_match$mzmine_sample_type,
+  stringsAsFactors = FALSE
+)
+
+# Media choices = media types that belong to actual samples (excludes
+# blank / qc / reference, which don't represent a growth condition)
+media_choices <- sort(unique(sample_info$media[sample_info$type == "sample"]))
+
+# Strain choices = strains that belong to actual samples
+strain_choices <- sort(unique(sample_info$strain[sample_info$type == "sample"]))
+
+# Full numeric peak-area matrix (all features x all samples), used as the
+# basis for optional per-sample normalization to a reference feature
+feat_mat_numeric <- as.matrix(feat_mat)
+mode(feat_mat_numeric) <- "numeric"
+
+# Feature id choices for the normalization dropdown
+feature_id_choices <- rownames(feat_mat_numeric)
+
+## ---- UI ------------------------------------------------------------------
+
+ui <- fluidPage(
+  titlePanel("MZmine2 Feature Table \u2014 Heatmap by Media Type"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        "media", "Media type:",
+        choices  = media_choices,
+        selected = media_choices[1]
+      ),
+      selectInput(
+        "strain", "Strain:",
+        choices  = c("All", strain_choices),
+        selected = "All"
+      ),
+      checkboxInput("include_qc", "Include QC / blank / reference samples", value = FALSE),
+      hr(),
+      checkboxInput("normalize", "Normalize to a reference feature", value = FALSE),
+      conditionalPanel(
+        condition = "input.normalize == true",
+        selectizeInput(
+          "norm_feature", "Normalization feature ID:",
+          choices = feature_id_choices,
+          selected = feature_id_choices[1],
+          options = list(placeholder = "Search feature id (mz_RT)...")
+        ),
+        helpText("Each sample's peak areas are divided by the peak area of ",
+                 "this feature in that same sample (e.g. an internal standard) ",
+                 "before log-transforming.")
+      ),
+      hr(),
+      sliderInput(
+        "n_features", "Number of most-variable features to show:",
+        min = 10, max = 150, value = 50, step = 10
+      ),
+      radioButtons(
+        "scale_by", "Row scaling:",
+        choices = c("Z-score" = "row", "None" = "none"),
+        selected = "row"
+      ),
+      hr(),
+      downloadButton("download_png", "Download heatmap as PNG"),
+      hr(),
+      helpText("Data: run2_mzmine2_feature_table.xlsx (Peak area columns)"),
+      helpText("Metadata: run-2_metadata.xlsx (used to look up media type per sample)"),
+      textOutput("n_samples_txt")
+    ),
+    mainPanel(
+      plotOutput("heatmap", height = "750px")
+    )
+  )
+)
+
+## ---- Server ----------------------------------------------------------------
+
+server <- function(input, output, session) {
+  
+  subset_info <- reactive({
+    if (input$include_qc) {
+      info <- sample_info[sample_info$media == input$media | sample_info$type != "sample", ]
+    } else {
+      info <- sample_info[sample_info$media == input$media & sample_info$type == "sample", ]
+    }
+    if (input$strain != "All") {
+      # keep QC/blank/reference rows (they have no strain) alongside the chosen strain
+      info <- info[info$strain == input$strain | info$type != "sample", ]
+    }
+    info
+  })
+  
+  output$n_samples_txt <- renderText({
+    paste0(nrow(subset_info()), " samples selected")
+  })
+  
+  # Full (all-feature x all-sample) matrix, optionally normalized so that
+  # each sample's values are divided by its own abundance of the chosen
+  # reference feature. Normalization is applied BEFORE subsetting to the
+  # selected media/strain/top-variable features, since it's a per-sample
+  # (per-column) scaling operation.
+  norm_full_mat <- reactive({
+    if (!isTRUE(input$normalize) || is.null(input$norm_feature) || input$norm_feature == "") {
+      return(feat_mat_numeric)
+    }
+    validate(need(input$norm_feature %in% rownames(feat_mat_numeric),
+                  "Selected normalization feature id not found in the feature table."))
+    norm_vals <- feat_mat_numeric[input$norm_feature, ]
+    norm_vals[norm_vals == 0] <- NA  # avoid divide-by-zero -> those samples become NA
+    sweep(feat_mat_numeric, 2, norm_vals, "/")
+  })
+  
+  # Prepares the top-variable-feature matrix + plot title for the current
+  # UI selections. Shared by both the on-screen plot and the PNG download,
+  # so they always stay in sync.
+  heatmap_data <- reactive({
+    info <- subset_info()
+    validate(need(nrow(info) >= 2, "Need at least 2 samples for this selection."))
+    
+    mat <- norm_full_mat()[, info$col_index, drop = FALSE]
+    colnames(mat) <- info$label
+    
+    # Normalized values are ratios (can be small fractions), so use a tiny
+    # pseudocount instead of +1 to avoid distorting them; raw peak areas
+    # keep the +1 pseudocount as before.
+    pseudo <- if (isTRUE(input$normalize)) 1e-6 else 1
+    mat_log <- log10(mat + pseudo)
+    
+    n_feat <- min(input$n_features, nrow(mat_log))
+    feature_var <- apply(mat_log, 1, var)
+    top_features <- order(feature_var, decreasing = TRUE)[1:n_feat]
+    mat_top <- mat_log[top_features, , drop = FALSE]
+    
+    title <- paste0(
+      input$media,
+      if (input$strain != "All") paste0(" / ", input$strain) else "",
+      " - top ", n_feat,
+      " most variable features (log10 ",
+      if (isTRUE(input$normalize)) paste0("peak area / ", input$norm_feature) else "peak area",
+      if (input$scale_by == "row") ", row z-score)" else ")"
+    )
+    
+    list(mat_top = mat_top, title = title)
+  })
+  
+  # Draws the pheatmap onto whatever graphics device is currently active
+  draw_heatmap <- function(hd) {
+    pheatmap(
+      hd$mat_top,
+      scale             = input$scale_by,
+      clustering_distance_rows = "euclidean",
+      clustering_distance_cols = "euclidean",
+      clustering_method = "complete",
+      color             = colorRampPalette(c("#3B4CC0", "white", "#B40426"))(100),
+      fontsize_row      = 7,
+      fontsize_col      = 9,
+      main              = hd$title
+    )
+  }
+  
+  output$heatmap <- renderPlot({
+    draw_heatmap(heatmap_data())
+  })
+  
+  output$download_png <- downloadHandler(
+    filename = function() {
+      strain_part <- if (input$strain != "All") paste0("_", input$strain) else ""
+      norm_part   <- if (isTRUE(input$normalize)) "_normalized" else ""
+      raw_name <- paste0("heatmap_", input$media, strain_part, norm_part, ".png")
+      gsub("[^A-Za-z0-9_.-]", "", raw_name)
+    },
+    content = function(file) {
+      hd <- heatmap_data()
+      n_rows <- nrow(hd$mat_top)
+      n_cols <- ncol(hd$mat_top)
+      png(file,
+          width  = max(1200, 200 + n_cols * 30),
+          height = max(900, 200 + n_rows * 18),
+          res = 150)
+      draw_heatmap(hd)
+      dev.off()
+    }
+  )
+}
+
+shinyApp(ui, server)
