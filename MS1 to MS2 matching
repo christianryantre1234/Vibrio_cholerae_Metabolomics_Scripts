@@ -1,0 +1,348 @@
+"""
+merge_ms1_ms2.py
+
+Reconciles two INDEPENDENTLY ACQUIRED MZmine feature lists (an MS1-only run,
+optimized for clean quantification, and a separate MS2/DDA run, optimized for
+fragmentation) into a single merged table suitable for GNPS2 FBMN and SIRIUS.
+
+Why this is needed
+-------------------
+Even on the same instrument and same physical samples, two SEPARATE
+chromatographic injections never have identical retention times -- there is
+always some run-to-run RT drift (temperature, column condition, gradient
+timing). A naive "match by RT +/- fixed tolerance" approach will miss real
+matches or make wrong matches. This script:
+
+  Pass 1: mass-matches MS1 and MS2 features within a ppm tolerance to build a
+          calibration set of (MS1_rt, MS2_rt) pairs. Duplicate MS2 matches to
+          the same MS1 feature (e.g. from split/duplicated peaks) are
+          deduplicated by keeping the closest mass match.
+
+  Fit:    a robust linear model RT_MS2 ~ a + b * RT_MS1 is fit to the
+          calibration set, with iterative sigma-clipping to trim outliers
+          (e.g. mis-matches, co-eluting isomers).
+
+  Tol:    a data-driven RT tolerance is derived from the fit's residual std
+          (2.5 x residual std, floored at 0.05 min) rather than a fixed
+          hardcoded window.
+
+  Pass 2: every MS1 feature's RT is projected into "MS2 time" using the fit,
+          and matched against MS2 features within [mass tolerance] AND
+          [the derived RT tolerance]. Any MS2 row matched to more than one
+          MS1 row is flagged (ms2_row_claimed_by_multiple_ms1) rather than
+          silently assigned, since that usually indicates chromatographic
+          peak splitting.
+
+Output
+------
+  1. A merged CSV: one row per MS1 feature, carrying MS1's id/mz/rt/intensities
+     (the quantitative truth) plus the matched MS2 feature's id/rt/match
+     quality, ready to hand to GNPS2 as the "inputfeatures" quant table.
+  2. A relabeled MGF: the MS2 run's spectra, with each spectrum's FEATURE_ID
+     rewritten to the corresponding MS1 row's id, so the quant table and the
+     MGF use one consistent ID space (required for GNPS2/SIRIUS to link a
+     spectrum to the correct row).
+
+Usage
+-----
+  python merge_ms1_ms2.py \
+      --ms1-csv MS1_neg_feature_list.csv \
+      --ms2-csv MS2_neg_feature_list.csv \
+      --ms2-mgf MS2_neg_export_iimn_gnps.mgf \
+      --out-prefix merged_neg \
+      --ppm-tol 10
+
+Expects MZmine 4 modular CSV export headers (short form: id, mz, rt, and one
+intensity column per sample, e.g. "20260728_04_LB_Vc_Rug-1... Peak area").
+If your export uses legacy long-form headers ("row ID", "row m/z",
+"row retention time"), pass --legacy-headers.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+# --------------------------------------------------------------------------
+# I/O helpers
+# --------------------------------------------------------------------------
+
+def read_mzmine_csv(path: str, legacy_headers: bool = False) -> pd.DataFrame:
+    """Load an MZmine modular CSV export, standardizing to id/mz/rt columns.
+
+    Uses exact (fullmatch) header matching -- per prior project learnings,
+    substring matching on MZmine's short-form headers causes silent
+    column-detection failures.
+    """
+    df = pd.read_csv(path)
+
+    if legacy_headers:
+        id_col = _find_col(df, r"row ID")
+        mz_col = _find_col(df, r"row m/z")
+        rt_col = _find_col(df, r"row retention time")
+    else:
+        id_col = _find_col(df, r"id")
+        mz_col = _find_col(df, r"mz")
+        rt_col = _find_col(df, r"rt")
+
+    df = df.rename(columns={id_col: "id", mz_col: "mz", rt_col: "rt"})
+    df["id"] = df["id"].astype(str)
+    return df
+
+
+def _find_col(df: pd.DataFrame, pattern: str) -> str:
+    """Exact (fullmatch, case-insensitive) column name lookup."""
+    matches = [c for c in df.columns if re.fullmatch(pattern, c, flags=re.IGNORECASE)]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Expected exactly one column matching '{pattern}', found {matches}. "
+            f"Available columns: {list(df.columns)}"
+        )
+    return matches[0]
+
+
+def get_intensity_columns(df: pd.DataFrame) -> list:
+    """Every column that isn't id/mz/rt is treated as a per-sample intensity column."""
+    return [c for c in df.columns if c not in ("id", "mz", "rt")]
+
+
+def read_mgf(path: str) -> list:
+    """Minimal MGF parser. Returns a list of dicts with the block's params
+    (lowercased keys) plus 'peaks' (list of (mz, intensity) tuples) and
+    'raw_lines' (original param lines, for faithful rewriting).
+    """
+    spectra = []
+    current = None
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if line.strip() == "BEGIN IONS":
+                current = {"params": {}, "peaks": [], "raw_param_lines": []}
+            elif line.strip() == "END IONS":
+                spectra.append(current)
+                current = None
+            elif current is not None:
+                if "=" in line and " " not in line.split("=")[0]:
+                    key, _, val = line.partition("=")
+                    current["params"][key.strip().upper()] = val.strip()
+                    current["raw_param_lines"].append(line)
+                elif line.strip():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            current["peaks"].append((float(parts[0]), float(parts[1])))
+                        except ValueError:
+                            pass  # skip malformed peak lines
+    return spectra
+
+
+def write_mgf(spectra: list, path: str, id_map: dict) -> None:
+    """Write spectra back out, relabeling FEATURE_ID (and SCANS, if present)
+    via id_map {old_ms2_id: new_ms1_id}. Spectra with no mapping entry are
+    dropped (they had no confident MS1 match).
+    """
+    n_written = 0
+    with open(path, "w") as fh:
+        for spec in spectra:
+            old_id = spec["params"].get("FEATURE_ID") or spec["params"].get("SCANS")
+            if old_id not in id_map:
+                continue
+            new_id = id_map[old_id]
+            fh.write("BEGIN IONS\n")
+            for line in spec["raw_param_lines"]:
+                key, _, val = line.partition("=")
+                key_u = key.strip().upper()
+                if key_u == "FEATURE_ID":
+                    fh.write(f"FEATURE_ID={new_id}\n")
+                elif key_u == "SCANS":
+                    fh.write(f"SCANS={new_id}\n")
+                else:
+                    fh.write(line + "\n")
+            for mz, inten in spec["peaks"]:
+                fh.write(f"{mz} {inten}\n")
+            fh.write("END IONS\n\n")
+            n_written += 1
+    print(f"Wrote {n_written} relabeled spectra to {path}")
+
+
+# --------------------------------------------------------------------------
+# Matching logic
+# --------------------------------------------------------------------------
+
+def ppm_diff(a: float, b: float) -> float:
+    return abs(a - b) / a * 1e6
+
+
+def build_calibration_set(ms1: pd.DataFrame, ms2: pd.DataFrame, ppm_tol: float) -> pd.DataFrame:
+    """Pass 1: mass-match MS1 <-> MS2 features to build (ms1_rt, ms2_rt) pairs
+    for fitting the drift model. For each MS1 feature, keep only the closest
+    mass match among MS2 candidates within ppm_tol (deduplicates split peaks).
+    """
+    pairs = []
+    ms2_sorted = ms2.sort_values("mz").reset_index(drop=True)
+    mz_arr = ms2_sorted["mz"].values
+
+    for _, row in ms1.iterrows():
+        lo = row.mz - row.mz * ppm_tol * 1e-6
+        hi = row.mz + row.mz * ppm_tol * 1e-6
+        left = np.searchsorted(mz_arr, lo)
+        right = np.searchsorted(mz_arr, hi)
+        candidates = ms2_sorted.iloc[left:right]
+        if candidates.empty:
+            continue
+        # keep closest mass match only, for calibration purposes
+        best = candidates.iloc[(candidates.mz - row.mz).abs().argsort().iloc[0]]
+        pairs.append({"ms1_id": row.id, "ms1_rt": row.rt, "ms2_id": best.id, "ms2_rt": best.rt})
+
+    return pd.DataFrame(pairs)
+
+
+def fit_robust_linear(x: np.ndarray, y: np.ndarray, n_iter: int = 5, sigma: float = 3.0):
+    """Iterative sigma-clipping linear fit: y ~ a + b*x.
+    Returns (intercept, slope, residual_std, mask_of_points_kept).
+    """
+    mask = np.ones(len(x), dtype=bool)
+    a, b = 0.0, 1.0
+    resid_std = np.nan
+
+    for _ in range(n_iter):
+        if mask.sum() < 3:
+            break
+        b, a = np.polyfit(x[mask], y[mask], 1)
+        pred = a + b * x
+        resid = y - pred
+        resid_std = resid[mask].std()
+        if resid_std == 0:
+            break
+        new_mask = np.abs(resid) <= sigma * resid_std
+        if new_mask.sum() == mask.sum():
+            mask = new_mask
+            break
+        mask = new_mask
+
+    return a, b, resid_std, mask
+
+
+def pass2_match(ms1: pd.DataFrame, ms2: pd.DataFrame, a: float, b: float,
+                 rt_tol: float, ppm_tol: float) -> pd.DataFrame:
+    """For every MS1 feature, project its RT into MS2 time via the fitted
+    drift model, then find MS2 candidates within [ppm_tol] AND [rt_tol] of
+    that projection. If multiple MS1 features claim the same MS2 row, flag
+    it rather than silently picking one (surfaces chromatographic peak
+    splitting for manual review).
+    """
+    ms2_sorted = ms2.sort_values("mz").reset_index(drop=True)
+    mz_arr = ms2_sorted["mz"].values
+
+    matches = []
+    claims = {}  # ms2_id -> list of ms1_ids that matched it
+
+    for _, row in ms1.iterrows():
+        predicted_rt = a + b * row.rt
+        lo = row.mz - row.mz * ppm_tol * 1e-6
+        hi = row.mz + row.mz * ppm_tol * 1e-6
+        left = np.searchsorted(mz_arr, lo)
+        right = np.searchsorted(mz_arr, hi)
+        candidates = ms2_sorted.iloc[left:right]
+        candidates = candidates[(candidates.rt - predicted_rt).abs() <= rt_tol]
+
+        if candidates.empty:
+            matches.append({
+                "ms1_id": row.id, "ms1_mz": row.mz, "ms1_rt": row.rt,
+                "predicted_ms2_rt": predicted_rt,
+                "ms2_id": None, "ms2_mz": None, "ms2_rt": None,
+                "mz_ppm_error": None, "rt_error_from_prediction": None,
+            })
+            continue
+
+        best = candidates.iloc[(candidates.mz - row.mz).abs().argsort().iloc[0]]
+        matches.append({
+            "ms1_id": row.id, "ms1_mz": row.mz, "ms1_rt": row.rt,
+            "predicted_ms2_rt": predicted_rt,
+            "ms2_id": best.id, "ms2_mz": best.mz, "ms2_rt": best.rt,
+            "mz_ppm_error": ppm_diff(row.mz, best.mz),
+            "rt_error_from_prediction": best.rt - predicted_rt,
+        })
+        claims.setdefault(best.id, []).append(row.id)
+
+    result = pd.DataFrame(matches)
+    result["ms2_row_claimed_by_multiple_ms1"] = result["ms2_id"].map(
+        lambda mid: len(claims.get(mid, [])) > 1 if mid is not None else False
+    )
+    return result
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--ms1-csv", required=True, help="MS1-only MZmine feature list CSV")
+    parser.add_argument("--ms2-csv", required=True, help="MS2/DDA MZmine feature list CSV")
+    parser.add_argument("--ms2-mgf", required=True, help="MS2/DDA MZmine MGF export (GNPS-formatted)")
+    parser.add_argument("--out-prefix", required=True, help="Prefix for output files")
+    parser.add_argument("--ppm-tol", type=float, default=10.0, help="m/z matching tolerance in ppm (default 10)")
+    parser.add_argument("--legacy-headers", action="store_true", help="Use legacy long-form MZmine headers")
+    args = parser.parse_args()
+
+    print("Loading feature lists...")
+    ms1 = read_mzmine_csv(args.ms1_csv, args.legacy_headers)
+    ms2 = read_mzmine_csv(args.ms2_csv, args.legacy_headers)
+    print(f"  MS1: {len(ms1)} features | MS2: {len(ms2)} features")
+
+    print("\nPass 1: building RT calibration set via mass matching...")
+    calib = build_calibration_set(ms1, ms2, args.ppm_tol)
+    print(f"  {len(calib)} mass-matched pairs found for calibration")
+    if len(calib) < 10:
+        sys.exit("Too few calibration pairs to fit a reliable drift model. "
+                 "Check that --ppm-tol is reasonable and both files are the same polarity/samples.")
+
+    print("\nFitting robust linear RT drift model (MS2_rt ~ a + b*MS1_rt)...")
+    a, b, resid_std, mask = fit_robust_linear(calib.ms1_rt.values, calib.ms2_rt.values)
+    print(f"  Fit: MS2_rt = {a:.3f} + {b:.3f} * MS1_rt  (R.std={resid_std:.4f} min, "
+          f"{mask.sum()}/{len(mask)} pairs kept after outlier trimming)")
+
+    rt_tol = max(2.5 * resid_std, 0.05)
+    print(f"  Derived RT tolerance: {rt_tol:.4f} min (2.5x residual std, floored at 0.05)")
+
+    print("\nPass 2: matching MS1 features to MS2 spectra using drift-corrected RT...")
+    matched = pass2_match(ms1, ms2, a, b, rt_tol, args.ppm_tol)
+    n_matched = matched["ms2_id"].notna().sum()
+    n_flagged = matched["ms2_row_claimed_by_multiple_ms1"].sum()
+    print(f"  {n_matched}/{len(ms1)} MS1 features matched to an MS2 spectrum")
+    print(f"  {n_flagged} matches flagged as ms2_row_claimed_by_multiple_ms1 (review these manually)")
+
+    # Merge in MS1 intensity columns (the quantitative truth)
+    intensity_cols = get_intensity_columns(ms1)
+    merged = matched.merge(ms1[["id"] + intensity_cols], left_on="ms1_id", right_on="id", how="left")
+    merged = merged.drop(columns=["id"])
+
+    out_csv = f"{args.out_prefix}_merged_quant.csv"
+    merged.to_csv(out_csv, index=False)
+    print(f"\nWrote merged quant table: {out_csv}")
+
+    print("\nRelabeling MS2 spectra to MS1 feature IDs for MGF export...")
+    spectra = read_mgf(args.ms2_mgf)
+    id_map = {
+        row.ms2_id: row.ms1_id
+        for row in matched.itertuples()
+        if row.ms2_id is not None and not row.ms2_row_claimed_by_multiple_ms1
+    }
+    out_mgf = f"{args.out_prefix}_merged.mgf"
+    write_mgf(spectra, out_mgf, id_map)
+
+    print("\nDone. Feed these two files to GNPS2 (inputfeatures / inputspectra) and SIRIUS:")
+    print(f"  {out_csv}")
+    print(f"  {out_mgf}")
+    print("\nNote: flagged multi-claim rows were excluded from the MGF (their spectra are ambiguous) "
+          "but are still present in the merged CSV for your own review -- check "
+          "ms2_row_claimed_by_multiple_ms1 == True rows before trusting their annotation.")
+
+
+if __name__ == "__main__":
+    main()
