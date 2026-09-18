@@ -1,0 +1,33 @@
+import csv
+
+src = "structure_identifications.tsv"
+dst = "structure_identifications_confidence_gt0.5.csv"
+
+with open(src, encoding="utf-8", newline="") as f:
+    rows = list(csv.DictReader(f, delimiter="\t"))
+header = list(rows[0].keys())
+
+def num(x):
+    # "-Infinity" and blanks become -inf, so they sort last and fail the filter
+    try:
+        return float(x)
+    except ValueError:
+        return float("-inf")
+
+# Sort by exact confidence (highest first), ties broken by approximate confidence
+rows.sort(
+    key=lambda r: (num(r["SIRIUS_ConfidenceScoreExact"]),
+                   num(r["SIRIUS_ConfidenceScoreApproximate"])),
+    reverse=True,
+)
+
+# Keep only rows with exact confidence > 0.500
+keep = [r for r in rows if num(r["SIRIUS_ConfidenceScoreExact"]) > 0.5]
+
+# utf-8-sig adds a BOM so Excel opens the file with the right encoding
+with open(dst, "w", encoding="utf-8-sig", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=header)
+    w.writeheader()
+    w.writerows(keep)
+
+print(f"{len(keep)} of {len(rows)} rows kept")
